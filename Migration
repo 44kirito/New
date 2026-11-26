@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Helper to reliably get terminal width
+get_cols() {
+  local cols=""
+  cols=$(tput cols 2>/dev/null) || true
+  if [[ -z "$cols" || "$cols" -le 0 ]]; then
+    cols=$(stty size 2>/dev/null | awk '{print $2}') || true
+  fi
+  echo "${cols:-80}"
+}
+
+# --- Terminal Centering & Input Helpers ---
+center() {
+  local clean
+  clean=$(echo -e "$1" | sed -r 's/\x1B\[[0-9;]*[mK]//g')
+  local cols
+  cols=$(get_cols)
+  local pad=$(( (cols - ${#clean}) / 2 ))
+  (( pad < 0 )) && pad=0
+  printf "%*s%b\n" "$pad" "" "$1"
+}
+
+center_read() {
+  local prompt="$1"
+  local varname="${2:-REPLY}"
+  local default_val="${3:-}"
+  local color="${4:-}"
+  local clean
+  clean=$(echo -e "$prompt$default_val" | sed -r 's/\x1B\[[0-9;]*[mK]//g')
+  local cols
+  cols=$(get_cols)
+  local pad=$(( (cols - ${#clean}) / 2 ))
+  (( pad < 0 )) && pad=0
+  local spaces
+  printf -v spaces "%*s" "$pad" ""
+
+  if [[ -n "$default_val" ]]; then
+    if [[ -n "$color" ]]; then
+      local esc_color
+      printf -v esc_color "%b" "$color"
+      read -e -p "${spaces}${prompt}"$'\001'"${esc_color}"$'\002' -i "$default_val" "$varname"
+      printf "\033[0m"
+    else
+      read -e -p "${spaces}${prompt}" -i "$default_val" "$varname"
+    fi
+  else
+    read -e -p "${spaces}${prompt}" "$varname"
+  fi
+}
+
+# --- Centered Background Progress Bar (Compression) ---
+show_progress() {
+  local pid=$1
+  local width=36
+  local pos=0
+  local dir=1
+  local block=8
+
+  tput civis 2>/dev/null || true
+
+  while kill -0 "$pid" 2>/dev/null; do
+    local bar=""
+    for ((i=0; i<width; i++)); do
+      if (( i >= pos && i < pos + block )); then
+        bar+="#"
+      else
+        bar+="-"
+      fi
+    done
+
+    local line="Compressing: [${bar}]"
+    local cols
+    cols=$(get_cols)
+    local pad=$(( (cols - ${#line}) / 2 ))
+    (( pad < 0 )) && pad=0
+
+    printf "\r%*s\033[0;32m%s\033[0m" "$pad" "" "$line"
+
+    pos=$((pos + dir))
+    if (( pos + block >= width )); then
+      dir=-1
+    elif (( pos <= 0 )); then
+      dir=1
+    fi
+
+    sleep 0.1
+  done
+
+  # Print completed full bar
+  local full_bar
+  printf -v full_bar "%*s" "$width" ""
+  full_bar=${full_bar// /#}
+  local done_line="Compressing: [${full_bar}] Done!"
+  local cols
+  cols=$(get_cols)
+  local pad=$(( (cols - ${#done_line}) / 2 ))
+  (( pad < 0 )) && pad=0
+  printf "\r%*s\033[1;32m%s\033[0m\n" "$pad" "" "$done_line"
+
+  tput cnorm 2>/dev/null || true
+}
+
+# --- Centered 0%-100% Progress Bar (Verification) ---
+show_verify_progress() {
+  local pid=$1
+  local total_bytes=$2
+  local width=36
+
+  tput civis 2>/dev/null || true
+
+  while kill -0 "$pid" 2>/dev/null; do
+    local current_bytes=0
+    if [[ -r "/proc/${pid}/fdinfo/0" ]]; then
+      current_bytes=$(awk '/^pos:/ {print $2}' "/proc/${pid}/fdinfo/0" 2>/dev/null || echo 0)
+    fi
+
+    local pct=0
+    if (( total_bytes > 0 )); then
+      pct=$(( current_bytes * 100 / total_bytes ))
+      (( pct > 99 )) && pct=99
+      (( pct < 0 )) && pct=0
+    fi
+
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local bar_fill=""
+    local bar_empty=""
+    (( filled > 0 )) && printf -v bar_fill "%*s" "$filled" "" && bar_fill=${bar_fill// /#}
+    (( empty > 0 )) && printf -v bar_empty "%*s" "$empty" "" && bar_empty=${bar_empty// /-}
+
+    local line
+    printf -v line "Verifying: [%s%s] %3d%%" "$bar_fill" "$bar_empty" "$pct"
+    local cols
+    cols=$(get_cols)
+    local pad=$(( (cols - ${#line}) / 2 ))
+    (( pad < 0 )) && pad=0
+
+    printf "\r%*s\033[0;32m%s\033[0m" "$pad" "" "$line"
+    sleep 0.1
+  done
+
+  # Print 100% completed bar
+  local full_bar
+  printf -v full_bar "%*s" "$width" ""
+  full_bar=${full_bar// /#}
+  local done_line="Verifying: [${full_bar}] 100%"
+  local cols
+  cols=$(get_cols)
+  local pad=$(( (cols - ${#done_line}) / 2 ))
+  (( pad < 0 )) && pad=0
+  printf "\r%*s\033[1;32m%s\033[0m\n" "$pad" "" "$done_line"
+
+  tput cnorm 2>/dev/null || true
+}
+
+# --- 1. Root Check ---
+if [[ "$EUID" -ne 0 ]]; then
+  echo ""
+  center "\033[0;31mError: This script must be run as root (use sudo or log in as root).\033[0m"
+  echo ""
+  exit 1
+fi
+
+BASE_DIR="/home/consortium3"
+if [[ ! -d "$BASE_DIR" ]]; then
+  echo ""
+  center "\033[0;31mError: Directory $BASE_DIR does not exist.\033[0m"
+  echo ""
+  exit 1
+fi
+
+# --- 2. Banner & Interactive Prompts ---
+clear 2>/dev/null || true
+echo ""
+center "\033[1;36m==============================================================\033[0m"
+center "\033[1;36m        CentOS 7 / Oracle Linux 8 Migration Backup Tool       \033[0m"
+center "\033[1;36m==============================================================\033[0m"
+echo ""
+
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+HOSTNAME_SHORT=$(hostname -s)
+DEFAULT_ARCHIVE="${HOSTNAME_SHORT}-migration-backup-${TIMESTAMP}.tar.bz2"
+
+center_read "Include audio recordings in backup? (y/n): " INCLUDE_RECORDINGS "n" "\033[0;32m"
+echo ""
+center_read "Backup archive filename: " ARCHIVE_NAME "$DEFAULT_ARCHIVE" "\033[0;32m"
+echo ""
+
+# Ensure .tar.bz2 extension if user edited the name without one
+[[ "$ARCHIVE_NAME" != *.tar.bz2 ]] && ARCHIVE_NAME="${ARCHIVE_NAME}.tar.bz2"
+
+TMP_DIR="${BASE_DIR}/TMP_migration_${TIMESTAMP}"
+META_DIR="${TMP_DIR}/system_info"
+ARCHIVE_PATH="${BASE_DIR}/${ARCHIVE_NAME}"
+
+# Overwrite protection if user entered an existing filename
+if [[ -e "$ARCHIVE_PATH" ]]; then
+  center "\033[1;33mWarning: ${ARCHIVE_PATH} already exists!\033[0m"
+  center_read "Overwrite existing archive? (y/n): " OVERWRITE "n" "\033[0;32m"
+  echo ""
+  if [[ ! "$OVERWRITE" =~ ^[Yy]$ ]]; then
+    center "\033[0;31mBackup cancelled.\033[0m"
+    echo ""
+    exit 1
+  fi
+fi
+
+# Always clean up staging TMP directory and restore cursor on exit
+cleanup() {
+  tput cnorm 2>/dev/null || true
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+mkdir -p "$META_DIR"
+
+# --- 3. Gather System Information ---
+center "\033[0;36mGathering system information (hostname, IP, timezone)...\033[0m"
+hostname > "${META_DIR}/hostname.txt"
+ip addr > "${META_DIR}/ip-addr.txt"
+timedatectl > "${META_DIR}/timezone.txt"
+
+# --- 4. Collect Exact Files & Directories ---
+BACKUP_TARGETS=()
+
+add_if_exists() {
+  for path in "$@"; do
+    if [[ -e "$path" ]]; then
+      BACKUP_TARGETS+=("$path")
+    fi
+  done
+}
+
+# Exact files
+add_if_exists \
+  "/etc/ntp.conf" \
+  "/etc/rsyslog.conf" \
+  "/etc/consortium3.conf"
+
+# Exact directories
+add_if_exists \
+  "/home/consortium3/.wine/drive_c/audiosrv" \
+  "/usr/local/etc/kamailio" \
+  "/etc/httpd" \
+  "/usr/local/freeswitch/conf"
+
+# Network interface configs (ifcfg-*)
+shopt -s nullglob
+IFCFG_FILES=(/etc/sysconfig/network-scripts/ifcfg-*)
+shopt -u nullglob
+if [[ ${#IFCFG_FILES[@]} -gt 0 ]]; then
+  BACKUP_TARGETS+=("${IFCFG_FILES[@]}")
+fi
+
+# SSL/TLS Certificates for Apache, FreeSWITCH, and Kamailio
+add_if_exists \
+  "/etc/pki/tls/certs" \
+  "/etc/pki/tls/private" \
+  "/usr/local/freeswitch/certs"
+
+# --- 5. Handle Recordings Exclusion ---
+TAR_EXCLUDES=()
+RECORDING_DIR="/home/consortium3/.wine/drive_c/audiosrv/recording"
+if [[ ! "$INCLUDE_RECORDINGS" =~ ^[Yy]$ && -d "$RECORDING_DIR" ]]; then
+  center "\033[0;33mSkipping recording files (preserving empty directory & permissions)...\033[0m"
+  TAR_EXCLUDES+=(--exclude="${RECORDING_DIR#/}/*")
+fi
+
+# --- 6. Create Single Compressed Archive in Background with Progress Bar ---
+echo ""
+center "\033[0;36mCreating compressed archive (preserving ownership & permissions)...\033[0m"
+echo ""
+
+set +e
+tar -cjpf "$ARCHIVE_PATH" \
+  --numeric-owner \
+  --warning=no-file-changed \
+  "${TAR_EXCLUDES[@]}" \
+  -C "$TMP_DIR" "system_info" \
+  -C / "${BACKUP_TARGETS[@]#/}" 2>"${TMP_DIR}/tar_error.log" &
+TAR_PID=$!
+
+show_progress "$TAR_PID"
+wait "$TAR_PID"
+TAR_EXIT=$?
+set -e
+
+if [[ "$TAR_EXIT" -ge 2 ]]; then
+  echo ""
+  center "\033[0;31mERROR: Archive creation failed (tar exit code $TAR_EXIT):\033[0m"
+  cat "${TMP_DIR}/tar_error.log" >&2
+  echo ""
+  exit 1
+fi
+
+# Set ownership to consortium3 for WinSCP / PSFTP download
+if id "consortium3" &>/dev/null; then
+  chown consortium3:consortium3 "$ARCHIVE_PATH"
+fi
+chmod 600 "$ARCHIVE_PATH"
+
+# --- 7. Verify Archive Integrity with 0%-100% Progress Bar & Display Summary ---
+echo ""
+center "\033[0;36mVerifying archive integrity...\033[0m"
+echo ""
+
+TOTAL_BYTES=$(stat -c%s "$ARCHIVE_PATH" 2>/dev/null || echo 0)
+
+set +e
+tar -tj < "$ARCHIVE_PATH" > /dev/null 2>&1 &
+VERIFY_PID=$!
+
+show_verify_progress "$VERIFY_PID" "$TOTAL_BYTES"
+wait "$VERIFY_PID"
+VERIFY_EXIT=$?
+set -e
+
+if [[ "$VERIFY_EXIT" -eq 0 ]]; then
+  SIZE=$(du -sh "$ARCHIVE_PATH" | cut -f1)
+  echo ""
+  center "\033[1;32m==============================================================\033[0m"
+  center "\033[1;32m               BACKUP COMPLETED & VERIFIED                    \033[0m"
+  center "\033[1;32m==============================================================\033[0m"
+  echo ""
+  center "\033[1;33mArchive File : ${ARCHIVE_PATH}\033[0m"
+  center "\033[1;33mArchive Size : ${SIZE}\033[0m"
+  center "\033[1;33mRecordings   : $( [[ "$INCLUDE_RECORDINGS" =~ ^[Yy]$ ]] && echo "Included" || echo "Excluded (Folder Kept)" )\033[0m"
+  echo ""
+  center "Ready to download via WinSCP or PSFTP from ${BASE_DIR}/"
+  echo ""
+else
+  echo ""
+  center "\033[0;31mERROR: Archive verification failed!\033[0m"
+  echo ""
+  exit 1
+fi
